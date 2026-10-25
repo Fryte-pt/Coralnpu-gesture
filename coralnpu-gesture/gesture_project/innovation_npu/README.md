@@ -1,0 +1,176 @@
+# GestureFlow-NPU: 项目自研手势推理加速器
+
+`GestureFlow-NPU` 是本项目新增的自研硬件创新分支。它只借鉴
+Google CoralNPU 的可验证架构思想，**不是** Google 官方模块，也不修改
+仓库根目录的只读 `coralnpu/`。
+
+## 要解决的实际问题
+
+摄像头手势识别是持续视频流任务。若处理器逐卷积窗口下命令或把每次
+卷积的 INT32 部分和写回 DDR，控制和存储能耗会压过 INT8 乘加本身。
+当前主线学生网络以 6 个 4x4 普通卷积和 1 个 1x1 头部卷积为主体，因此
+加速器的第一目标是连续空间卷积，而不是抽象的通用矩阵运算宣传。
+
+## v0 硬件结构
+
+```text
+PS/RVV 层级描述符
+        |
+        v
+命令 FIFO --> DMA/AXI --> 输入 ping-pong SRAM --> K 行滚动缓存
+                                                    |
+权重 SRAM (输出通道 tile 常驻) --------------------+--> INT8 MAC 阵列
+                                                           |
+                                              INT32 局部部分和 SRAM
+                                                           |
+                                  bias + requant + ReLU + pooling 融合流水
+                                                           |
+                                      输出 ping-pong SRAM --> DMA/AXI
+```
+
+核心数据流是：一个输入窗口在输出通道 tile 内广播；权重在该 tile 计算期间
+驻留；每个输出像素的 INT32 部分和跨所有输入通道 tile 保存在本地；只有量化
+后的 INT8 输出写回。权重 SRAM 的第一版容量只要求容纳一个输出通道 tile，
+不虚构“整层权重常驻”。调度器会针对每层选择“空间条带优先”或“输出通道 tile
+优先”，在输入重读与权重重读之间选择较低 DDR 流量。对于 3x3 层使用三行滚动
+缓存；当前 4x4 学生层使用四行滚动缓存。二者由同一 `kernel_rows` 参数控制，
+不能错误地把 4x4 层说成只需三行缓存。
+
+## 与 CoralNPU 的关系
+
+已核实的官方只读实现包含标量/RVV 解耦、VRF、队列、LSU、可选 `ZVT_ON`
+张量扩展、PE 阵列和累加器。GestureFlow-NPU 继承的是以下原则：
+
+1. 主机只提交层级描述符，硬件自行扫描空间位置，避免逐窗口控制。
+2. 计算、访存和写回通过队列与双缓冲解耦。
+3. INT8 乘法与 INT32 累加，并在片上融合量化和激活。
+4. 将规则空间卷积交给数据流引擎，把不规则控制、全局池化、分类头及后续
+   动态手势时序算子保留给 RVV/ZVT 方向。
+
+ZVT 在官方代码中是可选路径且部分注释仍标为开发中。因此不能把其尚未完成的
+tile 指令路径当成现成卷积后端；本分支将只复用已验证的设计原则，并自行完成
+项目侧验证。
+
+## 当前可运行证据
+
+### 真实全首层 TFLite 行为基准
+
+`tools/export_real_conv4x4_full_layer.py` 从当前硬件基准模型的真实第一个
+`CONV_2D` 张量导出 camera-domain RGB、权重和量化参数，并先证明零点折叠恒等式：
+
+```text
+sum((q - input_zero_point) * weight) + bias
+== sum(q * weight) + folded_bias
+folded_bias = bias - input_zero_point * sum(weight)
+```
+
+这不是可选优化，而是当前模型 `input_zero_point=-128` 与 signed INT8 MAC
+共存的必要条件。`SAME` 填充同样必须传入 `input_zero_point`，而不能用数值零。
+完整回归：
+
+```bash
+bash gesture_project/innovation_npu/tests/run_gestureflow_conv4x4_rgb_full_layer.sh
+```
+
+它以真实全范围 `96x96x3` RGB 输入验证整层 9,216 个空间输出、7 个边界/内部
+探针和所有 147,456 个量化结果的 FNV-1a 签名。当前预期是
+`0xF49B1B48`，实测 frame-start 到最后输出为 `221,488` 个 PL 周期。它是有
+180 秒硬超时的 Verilator 行为回归，不是 FPGA 帧率：25 MHz 仅作当前流水等价约
+`8.86 ms`，100 MHz 等价约 `2.21 ms`，两者都不含权重装载、DDR DMA 或后续层。
+完整板级性能必须在独立 layer IP 接入输入/输出 DMA 后重新测量。
+
+`configs/gestureflow_npu_v0.json` 固化了当前训练中 96x96、18 类学生模型的
+真实层形状。运行以下命令会生成确定性的周期、DDR 流量、尾部利用率和 SRAM
+容量报告：
+
+```bash
+python3 gesture_project/innovation_npu/tools/evaluate_gestureflow_design.py \
+  --config gesture_project/innovation_npu/configs/gestureflow_npu_v0.json \
+  --json-out /tmp/gestureflow_npu_v0_report.json \
+  --markdown-out /tmp/gestureflow_npu_v0_report.md
+```
+
+它是架构比较模型，不是 RTL 周期仿真，也不把估计周期表述为 FPGA 帧率。
+## 已验证 RTL
+
+第一版选择 `gf64` 的计算粒度：16 个输出通道 x 4 个输入通道，即每次输入组
+64 个 INT8 乘法。当前已用 Verilator 实际编译和运行三项项目侧测试：
+
+```bash
+bash gesture_project/innovation_npu/tests/run_gestureflow_mac_tile.sh
+bash gesture_project/innovation_npu/tests/run_gestureflow_line_window.sh
+bash gesture_project/innovation_npu/tests/run_gestureflow_conv4x4_stream.sh
+bash gesture_project/innovation_npu/tests/run_gestureflow_conv4x4_rgb_stream.sh
+```
+
+它们分别验证：权重驻留后的 INT8 乘加与 INT32 部分和、参数化 4x4 行缓存的六个
+连续窗口、以及无主机逐窗口控制的 4x4 流式卷积。测试脚本会从当前 `verilator`
+二进制位置自动推导 `VERILATOR_ROOT`，适配本机未执行系统级安装的 Verilator。
+
+### 实板 activation-staging 基线
+
+`gestureflow_activation_bank.sv` 与 `gestureflow_axil_microkernel.sv` 现已形成首个
+可实板验证的供数路径：PS 在任务启动前通过 AXI-Lite 将 256 个四路 INT8 activation
+word 装入片上 BRAM，随后用 `CONTROL=0x5` 启动 autonomous staged mode。硬件处理
+同步 BRAM 读延迟并连续向 16x4 MAC tile 发射，不在计算期间等待 ARM 写每个输入组。
+
+在 Zynq-7020、25MHz PL 时钟下，完整 `16 output x 16 tap x 16 input-group x 4 lane`
+事务为 16,384 INT8 MAC，真实板上周期计数为 `263`，16 路 INT32 结果逐条通过，
+即该**预装载后的执行段**约为 `1.557 GMAC/s`。该数字不含 PS 预装载、DDR/DMA、
+量化后处理或整层调度，因此不能当作模型端到端帧率。完整回归入口如下：
+
+```bash
+bash gesture_project/innovation_npu/tests/run_gestureflow_axil_microkernel.sh
+bash gesture_project/innovation_npu/board_7020/run_build_7020_from_wsl.sh
+bash gesture_project/innovation_npu/board_7020/build_software_7020_from_wsl.sh
+bash gesture_project/innovation_npu/board_7020/run_board_7020_from_wsl.sh
+```
+
+Windows 工程必须位于 `E:\coralnpu_vivado\projects\gestureflow_axil_baseline_7020_v1`，
+不能让 Vivado/XSCT 直接执行 `\\wsl.localhost\...` 路径。硬件服务器应使用
+`E:\Xilinx\Vivado\2023.2\bin\hw_server.bat -s tcp::3333`，板测 Tcl 已固定连接
+`tcp:127.0.0.1:3333`。
+
+### 可配置层任务边界
+
+`JOB_CFG (0x03c)` 让 staged mode 覆盖模型层尾通道，而不把阵列限制为满 `16x16`
+微基准：`[3:0]` 为 `tap_count-1`，`[7:4]` 为 `Cin-group-count-1`，`[11:8]` 为
+最后输入组的有效 lane 掩码，`[31:16]` 为有效输出 lane 掩码。Zynq-7020 实板已验证
+`4x4 x RGB(Cin=3)`：16 个 tap、1 组、mask `0b0111`，连续执行为 23 个 25MHz
+周期且全部 16 路 INT32 输出精确通过。这是当前从“满载阵列”进入真实模型首层的
+硬件边界，但仍不含真实模型权重、重定标、池化、DMA 或整网调度。
+
+`gestureflow_conv4x4_stream.sv` 当前只用于单输入通道集成对账，不能误写为 RGB
+或整网已经完成。RGB 首层 wrapper 已验证三路输入占用 4-lane MAC 的前三路、
+第四路显式掩码；下一步是跨输入通道累加与输出通道 tile 调度，再以真实 TFLite
+的量化激活、权重、bias 与 per-channel requant 做完整逐点比对；此后才加入命令
+描述符、DMA/AXI 和资源/时序验证。
+
+### `4x4 SAME` 空间调度已闭环的范围
+
+`rtl/gestureflow_same4x4_rgb_window.sv` 是首层真正的 TFLite `SAME` padding
+前端：对于偶数 `4x4`、stride 1，它固定使用 top/left 为 1，bottom/right 为 2
+的零填充，因此 `96x96` 输入产生完整 `96x96` 输出，而不是旧 valid-only 行缓存
+的 `93x93` 输出。`rtl/gestureflow_conv4x4_rgb_same_stream.sv` 将三个独立的行缓存
+接到已经验证的 `16x4` MAC tile，计算忙时通过 `window_ready` 反压输入，从而不会
+遗漏或覆盖边界窗口；它不依赖 ARM 的逐窗口命令。
+
+执行以下回归会在一个 `3x4` RGB 小帧上实际计算全部 12 个 SAME 输出。测试具有
+正负 INT8 权重、每通道不同输入和 bias，软件参考逐点覆盖四条边界和 RGB 尾 lane：
+
+```bash
+bash gesture_project/innovation_npu/tests/run_gestureflow_conv4x4_rgb_same_stream.sh
+```
+
+此阶段尚不是完整首层部署。它还没有连接当前 HP0 loader 的真实帧/行条带来源，
+也没有把每个输出向量写入 output bank 后经 AXI 写回 DDR。因此不能写成“完整
+96x96 首层已上板”或“模型已整网部署”。下一阶段将把 4 行输入条带的 HP0 装载、
+空间坐标到 output-bank 地址的映射及 output-tile 写回并入层级描述符；届时必须以
+真实 TFLite 首层全图 golden、Vivado 实现和 Zynq-7020 实板三重验证为准。
+
+`gestureflow_line_delay_bank.sv` 现将每个 RGB 通道的三条历史行实现为同步
+简单双口 BRAM，并携带读地址对应的像素、行列坐标和 valid 一拍。对 XC7Z020 的
+100MHz 独立综合，完整 SAME/RGB/16x4 前端使用 `1,453 LUT`、`2,357 FF`、`25`
+个 `RAMB18E1` 和 `80` 个 DSP，WNS 为 `+3.030ns`；其中 9 个 BRAM 是三路 RGB
+行延迟。由于当前输出端只有一个弹性窗口寄存器，窗口形成处保留安全 bubble，
+后续只有在加入有完整 full/empty 回归的窗口 FIFO 后才能消除，不能牺牲正确性。
